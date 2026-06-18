@@ -6,16 +6,19 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use burn::{
-    backend::wgpu::{Wgpu, WgpuDevice},
-    prelude::*,
-    tensor::TensorData,
-};
+#[cfg(feature = "cuda")]
+use burn::backend::cuda::{Cuda, CudaDevice};
+#[cfg(all(not(feature = "cuda"), feature = "wgpu"))]
+use burn::backend::wgpu::{Wgpu, WgpuDevice};
+use burn::{prelude::*, tensor::TensorData};
 use clap::Parser;
 use num_complex::Complex32;
 use rustfft::FftPlanner;
 use serde::Deserialize;
 use serde_json::Value;
+
+#[cfg(not(any(feature = "cuda", feature = "wgpu")))]
+compile_error!("enable at least one backend feature: 'wgpu' or 'cuda'");
 
 mod g_map_se {
     #![allow(dead_code)]
@@ -30,10 +33,23 @@ mod voxceleb_ecapa512 {
 use g_map_se::Model as EnhancementModel;
 use voxceleb_ecapa512::Model as EcapaModel;
 
+#[cfg(feature = "cuda")]
+type B = Cuda;
+#[cfg(feature = "cuda")]
+type BackendDevice = CudaDevice;
+
+#[cfg(all(not(feature = "cuda"), feature = "wgpu"))]
 type B = Wgpu;
+#[cfg(all(not(feature = "cuda"), feature = "wgpu"))]
+type BackendDevice = WgpuDevice;
+
+#[cfg(feature = "cuda")]
+const BACKEND_NAME: &str = "CUDA";
+#[cfg(all(not(feature = "cuda"), feature = "wgpu"))]
+const BACKEND_NAME: &str = "WGPU";
 
 #[derive(Parser, Debug)]
-#[command(about = "Run G-MaP-SE inference with a Burn WGPU model")]
+#[command(about = "Run G-MaP-SE inference with a Burn model")]
 struct Args {
     #[arg(long)]
     input_noisy_wavs_dir: PathBuf,
@@ -113,7 +129,7 @@ fn run(args: Args) -> Result<()> {
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("failed to create {}", args.output_dir.display()))?;
 
-    println!("Burn backend: WGPU");
+    println!("Burn backend: {BACKEND_NAME}");
     println!("Device: {:?}", device);
     println!("Files: {}", input_files.len());
 
@@ -186,7 +202,8 @@ fn resolve_path(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-fn parse_device(value: &str) -> Result<WgpuDevice> {
+#[cfg(all(not(feature = "cuda"), feature = "wgpu"))]
+fn parse_device(value: &str) -> Result<BackendDevice> {
     if value == "default" {
         return Ok(WgpuDevice::DefaultDevice);
     }
@@ -200,6 +217,19 @@ fn parse_device(value: &str) -> Result<WgpuDevice> {
         return Ok(WgpuDevice::IntegratedGpu(index.parse()?));
     }
     bail!("unsupported --device '{value}', expected default, cpu, discrete:N or integrated:N")
+}
+
+#[cfg(feature = "cuda")]
+fn parse_device(value: &str) -> Result<BackendDevice> {
+    if value == "default" {
+        return Ok(CudaDevice::default());
+    }
+    if let Some(index) = value.strip_prefix("cuda:") {
+        return Ok(CudaDevice {
+            index: index.parse()?,
+        });
+    }
+    bail!("unsupported --device '{value}', expected default or cuda:N")
 }
 
 fn wav_files(input_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -260,7 +290,7 @@ fn embedding_for_file(
     input_file: &Path,
     embeddings: Option<&Embeddings>,
     ecapa_model: &EcapaModel<B>,
-    device: &WgpuDevice,
+    device: &BackendDevice,
     wav: &[f32],
     metadata: &Metadata,
     embed_dim: usize,
@@ -294,7 +324,7 @@ fn embedding_for_file(
 
 fn extract_ecapa_embedding(
     model: &EcapaModel<B>,
-    device: &WgpuDevice,
+    device: &BackendDevice,
     wav: &[f32],
     metadata: &Metadata,
 ) -> Result<Vec<f32>> {
@@ -539,7 +569,7 @@ fn hamming_window(size: usize) -> Vec<f32> {
 
 fn enhance_audio(
     model: &EnhancementModel<B>,
-    device: &WgpuDevice,
+    device: &BackendDevice,
     noisy_wav: &[f32],
     embedding: &[f32],
     metadata: &Metadata,
@@ -599,7 +629,7 @@ fn enhance_audio(
 
 fn enhance_chunk_to_length(
     model: &EnhancementModel<B>,
-    device: &WgpuDevice,
+    device: &BackendDevice,
     noisy_wav: &[f32],
     model_chunk_size: usize,
     output_length: usize,
@@ -617,7 +647,7 @@ fn enhance_chunk_to_length(
 
 fn enhance_chunk(
     model: &EnhancementModel<B>,
-    device: &WgpuDevice,
+    device: &BackendDevice,
     noisy_wav: &[f32],
     embedding: &[f32],
     metadata: &Metadata,

@@ -5,9 +5,14 @@ edition = "2021"
 publish = false
 build = "build.rs"
 
+[features]
+default = ["wgpu"]
+wgpu = ["burn/wgpu"]
+cuda = ["burn/cuda"]
+
 [dependencies]
 anyhow = "1.0"
-burn = { version = "0.21", features = ["wgpu"] }
+burn = "0.21"
 burn-store = "0.21"
 clap = { version = "4.5", features = ["derive"] }
 glob = "0.3"
@@ -16,4 +21,3 @@ num-complex = "0.4"
 rustfft = "6.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
