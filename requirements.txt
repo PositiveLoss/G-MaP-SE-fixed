@@ -10,6 +10,9 @@ natsort
 pesq
 tqdm
 onnxruntime
+onnx
+onnxscript
+onnxslim
 torchaudio
 torchcodec
 matplotlib
