@@ -72,6 +72,12 @@ uv run export_g_map_se_onnx.py \
   --slim_output onnx/g_map_se.slim.onnx
 ```
 
+## Export ONNX to Burn
+
+```
+uv run prepare_burn_models.py
+```
+
 ## Acknowledgements
 
 We referred to [MP-SENet](https://github.com/yxlu-0102/MP-SENet) to implement this.
