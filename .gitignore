@@ -37,4 +37,5 @@ Thumbs.db
 *.swp
 *.swo
 
+noisy_wavs/
 clean_wavs/
