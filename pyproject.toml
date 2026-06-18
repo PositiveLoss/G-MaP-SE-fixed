@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "onnx>=1.22.0",
+    "onnxruntime-gpu[cuda]>=1.26.0",
     "onnxscript>=0.7.0",
     "onnxslim>=0.1.94",
     "ruff>=0.15.17",

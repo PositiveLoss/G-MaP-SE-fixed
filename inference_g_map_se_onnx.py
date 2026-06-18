@@ -23,14 +23,40 @@ def load_metadata(path):
         return json.load(f)
 
 
-def get_providers(provider):
+def get_providers(provider, use_cuda):
+    available = ort.get_available_providers()
     if provider:
+        if provider not in available:
+            raise RuntimeError(
+                "Requested ONNX Runtime provider '{}' is not available. "
+                "Available providers: {}".format(provider, ", ".join(available))
+            )
         return [provider]
 
-    available = ort.get_available_providers()
+    if use_cuda and "CUDAExecutionProvider" not in available:
+        raise RuntimeError(
+            "CUDA inference requested, but ONNX Runtime does not expose "
+            "CUDAExecutionProvider. Install a CUDA-enabled ONNX Runtime build "
+            "such as onnxruntime-gpu. Available providers: {}".format(
+                ", ".join(available)
+            )
+        )
+
     if "CUDAExecutionProvider" in available:
         return ["CUDAExecutionProvider", "CPUExecutionProvider"]
     return ["CPUExecutionProvider"]
+
+
+def get_torch_device(torch_device, providers):
+    if torch_device != "auto":
+        device = torch.device(torch_device)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("Torch CUDA device requested, but CUDA is not available")
+        return device
+
+    if "CUDAExecutionProvider" in providers and torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
 def get_embedding_session(ecapa_model_path):
@@ -87,7 +113,7 @@ def extract_noisy_embedding(input_file, metadata, allow_zero_fallback):
     )[0].astype(np.float32)
 
 
-def run_model(session, noisy_amp, noisy_pha, prior_embedding):
+def run_model(session, noisy_amp, noisy_pha, prior_embedding, torch_device):
     amp_g, pha_g = session.run(
         output_names=["amp_g", "pha_g"],
         input_feed={
@@ -96,10 +122,12 @@ def run_model(session, noisy_amp, noisy_pha, prior_embedding):
             "prior_embedding": prior_embedding.astype(np.float32),
         },
     )
-    return torch.from_numpy(amp_g), torch.from_numpy(pha_g)
+    return torch.from_numpy(amp_g).to(torch_device), torch.from_numpy(pha_g).to(
+        torch_device
+    )
 
 
-def enhance_chunk(session, noisy_wav, prior_embedding, metadata):
+def enhance_chunk(session, noisy_wav, prior_embedding, metadata, torch_device):
     noisy_wav = noisy_wav.unsqueeze(0)
     noisy_amp, noisy_pha, _ = mag_pha_stft(
         noisy_wav,
@@ -108,7 +136,9 @@ def enhance_chunk(session, noisy_wav, prior_embedding, metadata):
         metadata["win_size"],
         metadata["compress_factor"],
     )
-    amp_g, pha_g = run_model(session, noisy_amp, noisy_pha, prior_embedding)
+    amp_g, pha_g = run_model(
+        session, noisy_amp, noisy_pha, prior_embedding, torch_device
+    )
     audio_g = mag_pha_istft(
         amp_g,
         pha_g,
@@ -121,13 +151,21 @@ def enhance_chunk(session, noisy_wav, prior_embedding, metadata):
 
 
 def enhance_chunk_to_length(
-    session, noisy_wav, model_chunk_size, output_length, prior_embedding, metadata
+    session,
+    noisy_wav,
+    model_chunk_size,
+    output_length,
+    prior_embedding,
+    metadata,
+    torch_device,
 ):
     if noisy_wav.numel() < model_chunk_size:
         pad = noisy_wav.new_zeros(model_chunk_size - noisy_wav.numel())
         noisy_wav = torch.cat((noisy_wav, pad))
 
-    enhanced = enhance_chunk(session, noisy_wav, prior_embedding, metadata)
+    enhanced = enhance_chunk(
+        session, noisy_wav, prior_embedding, metadata, torch_device
+    )
     if enhanced.numel() < output_length:
         pad = enhanced.new_zeros(output_length - enhanced.numel())
         enhanced = torch.cat((enhanced, pad))
@@ -135,13 +173,19 @@ def enhance_chunk_to_length(
     return enhanced[:output_length]
 
 
-def enhance_audio(session, noisy_wav, prior_embedding, metadata):
+def enhance_audio(session, noisy_wav, prior_embedding, metadata, torch_device):
     chunk_size = metadata["chunk_size"]
     overlap_size = metadata["overlap_size"]
     audio_len = noisy_wav.size(0)
     if audio_len <= chunk_size:
         return enhance_chunk_to_length(
-            session, noisy_wav, chunk_size, audio_len, prior_embedding, metadata
+            session,
+            noisy_wav,
+            chunk_size,
+            audio_len,
+            prior_embedding,
+            metadata,
+            torch_device,
         )
 
     hop_size = chunk_size - overlap_size
@@ -158,16 +202,21 @@ def enhance_audio(session, noisy_wav, prior_embedding, metadata):
             chunk_len,
             prior_embedding,
             metadata,
+            torch_device,
         )
 
-        window = torch.ones(chunk_len)
+        window = torch.ones(chunk_len, device=noisy_wav.device)
         if overlap_size > 0:
             if start > 0:
                 fade_len = min(overlap_size, window.numel())
-                window[:fade_len] = torch.linspace(0, 1, fade_len + 2)[1:-1]
+                window[:fade_len] = torch.linspace(
+                    0, 1, fade_len + 2, device=noisy_wav.device
+                )[1:-1]
             if end < audio_len:
                 fade_len = min(overlap_size, window.numel())
-                window[-fade_len:] = torch.linspace(1, 0, fade_len + 2)[1:-1]
+                window[-fade_len:] = torch.linspace(
+                    1, 0, fade_len + 2, device=noisy_wav.device
+                )[1:-1]
 
         output[start:end] += enhanced_chunk * window
         weight[start:end] += window
@@ -181,7 +230,11 @@ def enhance_audio(session, noisy_wav, prior_embedding, metadata):
 def inference(args):
     metadata = load_metadata(args.metadata)
     onnx_file = args.onnx_file or metadata.get("slim_onnx_file") or metadata["onnx_file"]
-    session = ort.InferenceSession(onnx_file, providers=get_providers(args.provider))
+    providers = get_providers(args.provider, args.cuda)
+    torch_device = get_torch_device(args.torch_device, providers)
+    session = ort.InferenceSession(onnx_file, providers=providers)
+    print("ONNX Runtime providers:", session.get_providers())
+    print("Torch audio device:", torch_device)
 
     input_files = sorted(glob.glob(os.path.join(args.input_noisy_wavs_dir, "*.wav")))
     if not input_files:
@@ -196,12 +249,16 @@ def inference(args):
             input_file, metadata, args.allow_zero_embedding_fallback
         )
         noisy_wav, _ = librosa.load(input_file, sr=metadata["sampling_rate"])
-        noisy_wav = torch.FloatTensor(noisy_wav)
+        noisy_wav = torch.FloatTensor(noisy_wav).to(torch_device)
         norm_factor = torch.sqrt(
             len(noisy_wav) / torch.sum(noisy_wav**2.0).clamp_min(1e-12)
         )
         audio_g = enhance_audio(
-            session, noisy_wav * norm_factor, prior_embedding, metadata
+            session,
+            noisy_wav * norm_factor,
+            prior_embedding,
+            metadata,
+            torch_device,
         )
         audio_g = audio_g / norm_factor
 
@@ -221,6 +278,16 @@ def main():
     parser.add_argument("--metadata", default="onnx/g_map_se.onnx.json")
     parser.add_argument("--onnx_file", default="")
     parser.add_argument("--provider", default="")
+    parser.add_argument(
+        "--cuda",
+        action="store_true",
+        help="Require ONNX Runtime CUDAExecutionProvider.",
+    )
+    parser.add_argument(
+        "--torch_device",
+        default="auto",
+        help="Torch device for STFT/ISTFT overlap-add work: auto, cpu, cuda, cuda:0.",
+    )
     parser.add_argument("--allow_zero_embedding_fallback", action="store_true")
     args = parser.parse_args()
     inference(args)
