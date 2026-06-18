@@ -266,14 +266,11 @@ impl<B: Backend> Submodule1<B> {
         let unsqueeze1_out1: Tensor<B, 4> = noisy_amp.unsqueeze_dims::<4>(&[-1]);
         let unsqueeze2_out1: Tensor<B, 4> = noisy_pha.unsqueeze_dims::<4>(&[-1]);
         let reducel21_out1 = {
-            let input_dtype = prior_embedding.clone().dtype();
             prior_embedding
                 .clone()
                 .square()
                 .sum_dim(1usize)
-                .cast(burn::tensor::DType::F32)
                 .sqrt()
-                .cast(input_dtype)
         };
         let concat1_out1 = burn::tensor::Tensor::cat(
             [unsqueeze1_out1, unsqueeze2_out1].into(),
@@ -384,10 +381,8 @@ impl<B: Backend> Submodule1<B> {
         let transpose3_out1 = add1_out1.permute([0, 2, 1, 3]);
         let reshape5_out1 = transpose3_out1.reshape([404, 321, 64]);
         let layernormalization1_out1 = {
-            let dtype = reshape5_out1.clone().dtype();
             self.layernormalization1
-                .forward(reshape5_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(reshape5_out1.clone())
         };
         let transpose4_out1 = layernormalization1_out1.permute([1, 0, 2]);
         let reshape6_out1 = transpose4_out1.reshape([-1, 64]);
@@ -427,10 +422,8 @@ impl<B: Backend> Submodule1<B> {
         let transpose10_out1 = reshape12_out1.permute([1, 0, 2]);
         let add2_out1 = reshape5_out1.clone().add(transpose10_out1);
         let layernormalization2_out1 = {
-            let dtype = add2_out1.clone().dtype();
             self.layernormalization2
-                .forward(add2_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add2_out1.clone())
         };
         let constant70_out1 = self.constant70.val();
         let gru1_out1 = {
@@ -454,10 +447,8 @@ impl<B: Backend> Submodule1<B> {
         let reshape15_out1 = linear8_out1.reshape([404, 321, 64]);
         let add3_out1 = add2_out1.add(reshape15_out1);
         let layernormalization3_out1 = {
-            let dtype = add3_out1.dtype();
             self.layernormalization3
-                .forward(add3_out1.cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add3_out1)
         };
         let add4_out1 = layernormalization3_out1.add(reshape5_out1);
         (add4_out1, constant60_out1)
@@ -595,10 +586,8 @@ impl<B: Backend> Submodule2<B> {
         let transpose12_out1 = reshape16_out1.permute([0, 2, 1, 3]);
         let reshape17_out1 = transpose12_out1.reshape([1284, 101, 64]);
         let layernormalization4_out1 = {
-            let dtype = reshape17_out1.clone().dtype();
             self.layernormalization4
-                .forward(reshape17_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(reshape17_out1.clone())
         };
         let transpose13_out1 = layernormalization4_out1.permute([1, 0, 2]);
         let reshape18_out1 = transpose13_out1.reshape([-1, 64]);
@@ -637,10 +626,8 @@ impl<B: Backend> Submodule2<B> {
         let transpose19_out1 = reshape24_out1.permute([1, 0, 2]);
         let add5_out1 = reshape17_out1.clone().add(transpose19_out1);
         let layernormalization5_out1 = {
-            let dtype = add5_out1.clone().dtype();
             self.layernormalization5
-                .forward(add5_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add5_out1.clone())
         };
         let constant93_out1 = self.constant93.val();
         let gru2_out1 = {
@@ -664,20 +651,16 @@ impl<B: Backend> Submodule2<B> {
         let reshape27_out1 = linear11_out1.reshape([1284, 101, 64]);
         let add6_out1 = add5_out1.add(reshape27_out1);
         let layernormalization6_out1 = {
-            let dtype = add6_out1.dtype();
             self.layernormalization6
-                .forward(add6_out1.cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add6_out1)
         };
         let add7_out1 = layernormalization6_out1.add(reshape17_out1);
         let reshape28_out1 = add7_out1.reshape([4, 321, 101, 64]);
         let transpose21_out1 = reshape28_out1.permute([0, 2, 1, 3]);
         let reshape29_out1 = transpose21_out1.reshape([404, 321, 64]);
         let layernormalization7_out1 = {
-            let dtype = reshape29_out1.clone().dtype();
             self.layernormalization7
-                .forward(reshape29_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(reshape29_out1.clone())
         };
         let transpose22_out1 = layernormalization7_out1.permute([1, 0, 2]);
         let reshape30_out1 = transpose22_out1.reshape([-1, 64]);
@@ -716,10 +699,8 @@ impl<B: Backend> Submodule2<B> {
         let transpose28_out1 = reshape36_out1.permute([1, 0, 2]);
         let add8_out1 = reshape29_out1.clone().add(transpose28_out1);
         let layernormalization8_out1 = {
-            let dtype = add8_out1.clone().dtype();
             self.layernormalization8
-                .forward(add8_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add8_out1.clone())
         };
         let constant110_out1 = self.constant110.val();
         let gru3_out1 = {
@@ -743,10 +724,8 @@ impl<B: Backend> Submodule2<B> {
         let reshape39_out1 = linear14_out1.reshape([404, 321, 64]);
         let add9_out1 = add8_out1.add(reshape39_out1);
         let layernormalization9_out1 = {
-            let dtype = add9_out1.dtype();
             self.layernormalization9
-                .forward(add9_out1.cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add9_out1)
         };
         let add10_out1 = layernormalization9_out1.add(reshape29_out1);
         add10_out1
@@ -1046,10 +1025,8 @@ impl<B: Backend> Submodule3<B> {
         let transpose30_out1 = reshape40_out1.permute([0, 2, 1, 3]);
         let reshape41_out1 = transpose30_out1.reshape([1284, 101, 64]);
         let layernormalization10_out1 = {
-            let dtype = reshape41_out1.clone().dtype();
             self.layernormalization10
-                .forward(reshape41_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(reshape41_out1.clone())
         };
         let transpose31_out1 = layernormalization10_out1.permute([1, 0, 2]);
         let reshape42_out1 = transpose31_out1.reshape([-1, 64]);
@@ -1088,10 +1065,8 @@ impl<B: Backend> Submodule3<B> {
         let transpose37_out1 = reshape48_out1.permute([1, 0, 2]);
         let add11_out1 = reshape41_out1.clone().add(transpose37_out1);
         let layernormalization11_out1 = {
-            let dtype = add11_out1.clone().dtype();
             self.layernormalization11
-                .forward(add11_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add11_out1.clone())
         };
         let constant126_out1 = self.constant126.val();
         let gru4_out1 = {
@@ -1115,20 +1090,16 @@ impl<B: Backend> Submodule3<B> {
         let reshape51_out1 = linear17_out1.reshape([1284, 101, 64]);
         let add12_out1 = add11_out1.add(reshape51_out1);
         let layernormalization12_out1 = {
-            let dtype = add12_out1.dtype();
             self.layernormalization12
-                .forward(add12_out1.cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add12_out1)
         };
         let add13_out1 = layernormalization12_out1.add(reshape41_out1);
         let reshape52_out1 = add13_out1.reshape([4, 321, 101, 64]);
         let transpose39_out1 = reshape52_out1.permute([0, 2, 1, 3]);
         let reshape53_out1 = transpose39_out1.reshape([404, 321, 64]);
         let layernormalization13_out1 = {
-            let dtype = reshape53_out1.clone().dtype();
             self.layernormalization13
-                .forward(reshape53_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(reshape53_out1.clone())
         };
         let transpose40_out1 = layernormalization13_out1.permute([1, 0, 2]);
         let reshape54_out1 = transpose40_out1.reshape([-1, 64]);
@@ -1167,10 +1138,8 @@ impl<B: Backend> Submodule3<B> {
         let transpose46_out1 = reshape60_out1.permute([1, 0, 2]);
         let add14_out1 = reshape53_out1.clone().add(transpose46_out1);
         let layernormalization14_out1 = {
-            let dtype = add14_out1.clone().dtype();
             self.layernormalization14
-                .forward(add14_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add14_out1.clone())
         };
         let constant142_out1 = self.constant142.val();
         let gru5_out1 = {
@@ -1194,20 +1163,16 @@ impl<B: Backend> Submodule3<B> {
         let reshape63_out1 = linear20_out1.reshape([404, 321, 64]);
         let add15_out1 = add14_out1.add(reshape63_out1);
         let layernormalization15_out1 = {
-            let dtype = add15_out1.dtype();
             self.layernormalization15
-                .forward(add15_out1.cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add15_out1)
         };
         let add16_out1 = layernormalization15_out1.add(reshape53_out1);
         let reshape64_out1 = add16_out1.reshape([4, 101, 321, 64]);
         let transpose48_out1 = reshape64_out1.permute([0, 2, 1, 3]);
         let reshape65_out1 = transpose48_out1.reshape([1284, 101, 64]);
         let layernormalization16_out1 = {
-            let dtype = reshape65_out1.clone().dtype();
             self.layernormalization16
-                .forward(reshape65_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(reshape65_out1.clone())
         };
         let transpose49_out1 = layernormalization16_out1.permute([1, 0, 2]);
         let reshape66_out1 = transpose49_out1.reshape([-1, 64]);
@@ -1246,10 +1211,8 @@ impl<B: Backend> Submodule3<B> {
         let transpose55_out1 = reshape72_out1.permute([1, 0, 2]);
         let add17_out1 = reshape65_out1.clone().add(transpose55_out1);
         let layernormalization17_out1 = {
-            let dtype = add17_out1.clone().dtype();
             self.layernormalization17
-                .forward(add17_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add17_out1.clone())
         };
         let constant158_out1 = self.constant158.val();
         let gru6_out1 = {
@@ -1273,20 +1236,16 @@ impl<B: Backend> Submodule3<B> {
         let reshape75_out1 = linear23_out1.reshape([1284, 101, 64]);
         let add18_out1 = add17_out1.add(reshape75_out1);
         let layernormalization18_out1 = {
-            let dtype = add18_out1.dtype();
             self.layernormalization18
-                .forward(add18_out1.cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add18_out1)
         };
         let add19_out1 = layernormalization18_out1.add(reshape65_out1);
         let reshape76_out1 = add19_out1.reshape([4, 321, 101, 64]);
         let transpose57_out1 = reshape76_out1.permute([0, 2, 1, 3]);
         let reshape77_out1 = transpose57_out1.reshape([404, 321, 64]);
         let layernormalization19_out1 = {
-            let dtype = reshape77_out1.clone().dtype();
             self.layernormalization19
-                .forward(reshape77_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(reshape77_out1.clone())
         };
         let transpose58_out1 = layernormalization19_out1.permute([1, 0, 2]);
         let reshape78_out1 = transpose58_out1.reshape([-1, 64]);
@@ -1325,10 +1284,8 @@ impl<B: Backend> Submodule3<B> {
         let transpose64_out1 = reshape84_out1.permute([1, 0, 2]);
         let add20_out1 = reshape77_out1.clone().add(transpose64_out1);
         let layernormalization20_out1 = {
-            let dtype = add20_out1.clone().dtype();
             self.layernormalization20
-                .forward(add20_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add20_out1.clone())
         };
         let constant174_out1 = self.constant174.val();
         let gru7_out1 = {
@@ -1352,20 +1309,16 @@ impl<B: Backend> Submodule3<B> {
         let reshape87_out1 = linear26_out1.reshape([404, 321, 64]);
         let add21_out1 = add20_out1.add(reshape87_out1);
         let layernormalization21_out1 = {
-            let dtype = add21_out1.dtype();
             self.layernormalization21
-                .forward(add21_out1.cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add21_out1)
         };
         let add22_out1 = layernormalization21_out1.add(reshape77_out1);
         let reshape88_out1 = add22_out1.reshape([4, 101, 321, 64]);
         let transpose66_out1 = reshape88_out1.permute([0, 2, 1, 3]);
         let reshape89_out1 = transpose66_out1.reshape([1284, 101, 64]);
         let layernormalization22_out1 = {
-            let dtype = reshape89_out1.clone().dtype();
             self.layernormalization22
-                .forward(reshape89_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(reshape89_out1.clone())
         };
         let transpose67_out1 = layernormalization22_out1.permute([1, 0, 2]);
         let reshape90_out1 = transpose67_out1.reshape([-1, 64]);
@@ -1404,10 +1357,8 @@ impl<B: Backend> Submodule3<B> {
         let transpose73_out1 = reshape96_out1.permute([1, 0, 2]);
         let add23_out1 = reshape89_out1.clone().add(transpose73_out1);
         let layernormalization23_out1 = {
-            let dtype = add23_out1.clone().dtype();
             self.layernormalization23
-                .forward(add23_out1.clone().cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add23_out1.clone())
         };
         let constant190_out1 = self.constant190.val();
         let gru8_out1 = {
@@ -1431,10 +1382,8 @@ impl<B: Backend> Submodule3<B> {
         let reshape99_out1 = linear29_out1.reshape([1284, 101, 64]);
         let add24_out1 = add23_out1.add(reshape99_out1);
         let layernormalization24_out1 = {
-            let dtype = add24_out1.dtype();
             self.layernormalization24
-                .forward(add24_out1.cast(burn::tensor::DType::F32))
-                .cast(dtype)
+                .forward(add24_out1)
         };
         let add25_out1 = layernormalization24_out1.add(reshape89_out1);
         add25_out1
