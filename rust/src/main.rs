@@ -94,6 +94,12 @@ struct Metadata {
     win_size: usize,
     compress_factor: f32,
     embed_dim: usize,
+    #[serde(default = "default_burn_batch_size")]
+    burn_batch_size: usize,
+}
+
+fn default_burn_batch_size() -> usize {
+    1
 }
 
 const ECAPA_FRAMES: usize = 321;
@@ -238,6 +244,9 @@ fn validate_metadata(metadata: &Metadata) -> Result<()> {
     }
     if metadata.compress_factor <= 0.0 {
         bail!("metadata compress_factor must be positive");
+    }
+    if metadata.burn_batch_size == 0 {
+        bail!("metadata burn_batch_size must be positive");
     }
     Ok(())
 }
@@ -673,8 +682,9 @@ fn enhance_audio(
     mut stats: Option<&mut EnhanceStats>,
 ) -> Result<Vec<f32>> {
     let upload_start = Instant::now();
+    let prior_values = repeat_embedding(embedding, metadata.embed_dim, metadata.burn_batch_size);
     let prior = Tensor::<B, 2>::from_data(
-        TensorData::new(embedding.to_vec(), [1, metadata.embed_dim]),
+        TensorData::new(prior_values, [metadata.burn_batch_size, metadata.embed_dim]),
         device,
     );
     if let Some(stats) = stats.as_deref_mut() {
@@ -682,58 +692,73 @@ fn enhance_audio(
     }
 
     if noisy_wav.len() <= metadata.chunk_size {
-        return enhance_chunk_to_length(
+        let chunk = ChunkPlan {
+            start: 0,
+            end: noisy_wav.len(),
+            chunk_len: noisy_wav.len(),
+        };
+        let mut enhanced = enhance_chunk_batch(
             model,
             device,
             dsp,
             noisy_wav,
-            metadata.chunk_size,
-            noisy_wav.len(),
+            &[chunk],
             &prior,
             metadata,
             stats.as_deref_mut(),
-        );
+        )?;
+        return Ok(enhanced.remove(0));
     }
 
     let hop_size = metadata.chunk_size - metadata.overlap_size;
     let mut output = vec![0.0; noisy_wav.len()];
     let mut weight = vec![0.0; noisy_wav.len()];
 
+    let mut chunks = Vec::new();
     let mut start = 0;
     while start < noisy_wav.len() {
         let end = (start + metadata.chunk_size).min(noisy_wav.len());
         let chunk_len = end - start;
-        let enhanced = enhance_chunk_to_length(
-            model,
-            device,
-            dsp,
-            &noisy_wav[start..end],
-            metadata.chunk_size,
+        chunks.push(ChunkPlan {
+            start,
+            end,
             chunk_len,
-            &prior,
-            metadata,
-            stats.as_deref_mut(),
-        )?;
-        let blend_start = Instant::now();
-        let window = overlap_window(
-            chunk_len,
-            metadata.overlap_size,
-            start > 0,
-            end < noisy_wav.len(),
-        );
-
-        for index in 0..chunk_len {
-            output[start + index] += enhanced[index] * window[index];
-            weight[start + index] += window[index];
-        }
-        if let Some(stats) = stats.as_deref_mut() {
-            stats.blend += blend_start.elapsed();
-        }
+        });
 
         if end == noisy_wav.len() {
             break;
         }
         start += hop_size;
+    }
+
+    for batch in chunks.chunks(metadata.burn_batch_size) {
+        let enhanced_chunks = enhance_chunk_batch(
+            model,
+            device,
+            dsp,
+            noisy_wav,
+            batch,
+            &prior,
+            metadata,
+            stats.as_deref_mut(),
+        )?;
+        for (chunk, enhanced) in batch.iter().zip(enhanced_chunks) {
+            let blend_start = Instant::now();
+            let window = overlap_window(
+                chunk.chunk_len,
+                metadata.overlap_size,
+                chunk.start > 0,
+                chunk.end < noisy_wav.len(),
+            );
+
+            for index in 0..chunk.chunk_len {
+                output[chunk.start + index] += enhanced[index] * window[index];
+                weight[chunk.start + index] += window[index];
+            }
+            if let Some(stats) = stats.as_deref_mut() {
+                stats.blend += blend_start.elapsed();
+            }
+        }
     }
 
     for (sample, weight) in output.iter_mut().zip(weight) {
@@ -742,50 +767,76 @@ fn enhance_audio(
     Ok(output)
 }
 
-fn enhance_chunk_to_length(
-    model: &EnhancementModel<B>,
-    device: &BackendDevice,
-    dsp: &mut DspContext,
-    noisy_wav: &[f32],
-    model_chunk_size: usize,
-    output_length: usize,
-    prior: &Tensor<B, 2>,
-    metadata: &Metadata,
-    stats: Option<&mut EnhanceStats>,
-) -> Result<Vec<f32>> {
-    let mut chunk = noisy_wav.to_vec();
-    chunk.resize(model_chunk_size, 0.0);
-    let enhanced = enhance_chunk(model, device, dsp, &chunk, prior, metadata, stats)?;
-    let mut fixed = enhanced;
-    fixed.resize(output_length, 0.0);
-    fixed.truncate(output_length);
-    Ok(fixed)
+#[derive(Clone, Copy)]
+struct ChunkPlan {
+    start: usize,
+    end: usize,
+    chunk_len: usize,
 }
 
-fn enhance_chunk(
+fn repeat_embedding(embedding: &[f32], embed_dim: usize, batch_size: usize) -> Vec<f32> {
+    let mut repeated = Vec::with_capacity(embed_dim * batch_size);
+    for _ in 0..batch_size {
+        repeated.extend_from_slice(embedding);
+    }
+    repeated
+}
+
+fn enhance_chunk_batch(
     model: &EnhancementModel<B>,
     device: &BackendDevice,
     dsp: &mut DspContext,
     noisy_wav: &[f32],
+    chunks: &[ChunkPlan],
     prior: &Tensor<B, 2>,
     metadata: &Metadata,
     mut stats: Option<&mut EnhanceStats>,
-) -> Result<Vec<f32>> {
+) -> Result<Vec<Vec<f32>>> {
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
     if let Some(stats) = stats.as_deref_mut() {
-        stats.chunks += 1;
+        stats.chunks += chunks.len();
     }
 
     let stft_start = Instant::now();
-    let stft = mag_pha_stft(noisy_wav, metadata, dsp);
+    let batch_size = metadata.burn_batch_size;
+    let freq_bins = metadata.n_fft / 2 + 1;
+    let expected_frames = metadata.chunk_size / metadata.hop_size + 1;
+    let mut batch_mag = Vec::with_capacity(batch_size * freq_bins * expected_frames);
+    let mut batch_pha = Vec::with_capacity(batch_size * freq_bins * expected_frames);
+
+    for batch_index in 0..batch_size {
+        let mut chunk = match chunks.get(batch_index) {
+            Some(plan) => noisy_wav[plan.start..plan.end].to_vec(),
+            None => Vec::new(),
+        };
+        chunk.resize(metadata.chunk_size, 0.0);
+        let stft = mag_pha_stft(&chunk, metadata, dsp);
+        if stft.frames != expected_frames {
+            bail!(
+                "unexpected STFT frame count: got {}, expected {}",
+                stft.frames,
+                expected_frames
+            );
+        }
+        batch_mag.extend(stft.mag);
+        batch_pha.extend(stft.pha);
+    }
+
     if let Some(stats) = stats.as_deref_mut() {
         stats.stft += stft_start.elapsed();
     }
-    let freq_bins = metadata.n_fft / 2 + 1;
-    let frames = stft.frames;
 
     let upload_start = Instant::now();
-    let amp = Tensor::<B, 3>::from_data(TensorData::new(stft.mag, [1, freq_bins, frames]), device);
-    let pha = Tensor::<B, 3>::from_data(TensorData::new(stft.pha, [1, freq_bins, frames]), device);
+    let amp = Tensor::<B, 3>::from_data(
+        TensorData::new(batch_mag, [batch_size, freq_bins, expected_frames]),
+        device,
+    );
+    let pha = Tensor::<B, 3>::from_data(
+        TensorData::new(batch_pha, [batch_size, freq_bins, expected_frames]),
+        device,
+    );
     if let Some(stats) = stats.as_deref_mut() {
         stats.tensor_upload += upload_start.elapsed();
     }
@@ -804,11 +855,27 @@ fn enhance_chunk(
     }
 
     let istft_start = Instant::now();
-    let enhanced = mag_pha_istft(&amp_vec, &pha_vec, frames, noisy_wav.len(), metadata, dsp);
+    let chunk_values = freq_bins * expected_frames;
+    let mut enhanced_chunks = Vec::with_capacity(chunks.len());
+    for (batch_index, chunk) in chunks.iter().enumerate() {
+        let offset = batch_index * chunk_values;
+        let end = offset + chunk_values;
+        let mut enhanced = mag_pha_istft(
+            &amp_vec[offset..end],
+            &pha_vec[offset..end],
+            expected_frames,
+            metadata.chunk_size,
+            metadata,
+            dsp,
+        );
+        enhanced.resize(chunk.chunk_len, 0.0);
+        enhanced.truncate(chunk.chunk_len);
+        enhanced_chunks.push(enhanced);
+    }
     if let Some(stats) = stats.as_deref_mut() {
         stats.istft += istft_start.elapsed();
     }
-    Ok(enhanced)
+    Ok(enhanced_chunks)
 }
 
 fn overlap_window(

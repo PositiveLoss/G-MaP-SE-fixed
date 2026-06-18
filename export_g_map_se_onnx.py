@@ -40,12 +40,12 @@ def load_model(h, checkpoint_file):
     return model
 
 
-def build_dummy_inputs(h, chunk_size):
-    dummy_wav = torch.zeros(1, chunk_size)
+def build_dummy_inputs(h, chunk_size, batch_size):
+    dummy_wav = torch.zeros(batch_size, chunk_size)
     noisy_amp, noisy_pha, _ = mag_pha_stft(
         dummy_wav, h.n_fft, h.hop_size, h.win_size, h.compress_factor
     )
-    prior_embedding = torch.zeros(1, getattr(h, "embed_dim", 192))
+    prior_embedding = torch.zeros(batch_size, getattr(h, "embed_dim", 192))
     return noisy_amp, noisy_pha, prior_embedding
 
 
@@ -64,6 +64,7 @@ def save_metadata(args, h, config_file, onnx_path, slim_path, metadata_path):
         "win_size": h.win_size,
         "compress_factor": h.compress_factor,
         "embed_dim": getattr(h, "embed_dim", 192),
+        "burn_batch_size": args.batch_size,
         "ecapa_model_path": getattr(
             h, "ecapa_model_path", "ecapa_models/voxceleb_ECAPA512.onnx"
         ),
@@ -83,10 +84,14 @@ def export_onnx(args):
         raise ValueError("--overlap_size cannot be negative")
     if args.overlap_size >= args.chunk_size:
         raise ValueError("--overlap_size must be smaller than --chunk_size")
+    if args.batch_size <= 0:
+        raise ValueError("--batch_size must be positive")
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     model = GMapSEOnnxWrapper(load_model(h, args.checkpoint_file)).eval()
-    noisy_amp, noisy_pha, prior_embedding = build_dummy_inputs(h, args.chunk_size)
+    noisy_amp, noisy_pha, prior_embedding = build_dummy_inputs(
+        h, args.chunk_size, args.batch_size
+    )
 
     torch.onnx.export(
         model,
@@ -129,6 +134,15 @@ def main():
     parser.add_argument("--metadata", default="")
     parser.add_argument("--chunk_size", type=int, default=0)
     parser.add_argument("--overlap_size", type=int, default=0)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help=(
+            "Fixed enhancement batch size to bake into the ONNX/Burn model. "
+            "Use 16 to generate a model that processes 16 chunks per forward."
+        ),
+    )
     parser.add_argument("--opset", type=int, default=DEFAULT_ONNX_OPSET)
     parser.add_argument("--verify", action="store_true")
     args = parser.parse_args()

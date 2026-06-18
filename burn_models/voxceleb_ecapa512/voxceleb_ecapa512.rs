@@ -97,7 +97,7 @@ extern crate std;
 impl<B: Backend> Default for Model<B> {
     fn default() -> Self {
         Self::from_file(
-            "/tmp/burn_onnx_zqj9wdb7/target/debug/build/burn-onnx-converter-voxceleb-ecapa512-c337722ddd1ee63b/out/model/voxceleb_ecapa512.bpk",
+            "/tmp/burn_onnx_0nxrehe1/target/debug/build/burn-onnx-converter-voxceleb-ecapa512-c337722ddd1ee63b/out/model/voxceleb_ecapa512.bpk",
             &Default::default(),
         )
     }
