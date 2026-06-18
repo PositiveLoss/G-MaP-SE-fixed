@@ -14,6 +14,10 @@ use burn::backend::cuda::{Cuda, CudaDevice};
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::{prelude::*, tensor::TensorData};
 use clap::Parser;
+use kaldi_native_fbank::{
+    fbank::{FbankComputer, FbankOptions},
+    online::{FeatureComputer, OnlineFeature},
+};
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use serde::Deserialize;
@@ -166,6 +170,7 @@ fn run(args: Args) -> Result<()> {
             embeddings.as_ref(),
             &ecapa_model,
             &device,
+            &mut dsp,
             &wav,
             &metadata,
             metadata.embed_dim,
@@ -356,6 +361,7 @@ fn embedding_for_file(
     embeddings: Option<&Embeddings>,
     ecapa_model: &EcapaModel<B>,
     device: &BackendDevice,
+    dsp: &mut DspContext,
     wav: &[f32],
     metadata: &Metadata,
     embed_dim: usize,
@@ -373,7 +379,7 @@ fn embedding_for_file(
                 .or_else(|| map.get(input_file.to_string_lossy().as_ref()).cloned())
                 .ok_or_else(|| anyhow!("no embedding found for {basename}"))
         }
-        None => extract_ecapa_embedding(ecapa_model, device, wav, metadata).or_else(|error| {
+        None => extract_ecapa_embedding(ecapa_model, device, dsp, wav, metadata).or_else(|error| {
             if allow_zero {
                 eprintln!(
                     "warning: ECAPA embedding failed for {}: {error}; using zero fallback",
@@ -390,10 +396,11 @@ fn embedding_for_file(
 fn extract_ecapa_embedding(
     model: &EcapaModel<B>,
     device: &BackendDevice,
+    dsp: &mut DspContext,
     wav: &[f32],
     metadata: &Metadata,
 ) -> Result<Vec<f32>> {
-    let features = kaldi_fbank_fixed(wav, metadata.sampling_rate, ECAPA_FRAMES, ECAPA_MEL_BINS)?;
+    let features = kaldi_fbank_fixed(wav, dsp)?;
     let feats = Tensor::<B, 3>::from_data(
         TensorData::new(features, [1, ECAPA_FRAMES, ECAPA_MEL_BINS]),
         device,
@@ -504,84 +511,63 @@ fn rms_norm_factor(samples: &[f32]) -> f32 {
     ((samples.len() as f32) / energy.max(1e-12)).sqrt()
 }
 
-fn kaldi_fbank_fixed(
-    wav: &[f32],
-    sample_rate: u32,
-    target_frames: usize,
-    mel_bins: usize,
-) -> Result<Vec<f32>> {
+fn kaldi_fbank_fixed(wav: &[f32], _dsp: &mut DspContext) -> Result<Vec<f32>> {
     if wav.is_empty() {
         bail!("cannot extract ECAPA features from empty audio");
     }
 
-    let frame_length = ((sample_rate as f32) * ECAPA_FRAME_LENGTH_MS / 1000.0).round() as usize;
-    let frame_shift = ((sample_rate as f32) * ECAPA_FRAME_SHIFT_MS / 1000.0).round() as usize;
-    let fft_size = frame_length.next_power_of_two();
-    let frames = if wav.len() >= frame_length {
-        1 + (wav.len() - frame_length) / frame_shift
-    } else {
-        1
-    };
-    let hamming = hamming_window(frame_length);
-    let mel_filters = mel_filterbank(mel_bins, fft_size, sample_rate);
+    let mut opts = FbankOptions::default();
+    opts.frame_opts.samp_freq = 16_000.0;
+    opts.frame_opts.frame_length_ms = ECAPA_FRAME_LENGTH_MS;
+    opts.frame_opts.frame_shift_ms = ECAPA_FRAME_SHIFT_MS;
+    opts.frame_opts.dither = 0.0;
+    opts.frame_opts.preemph_coeff = 0.97;
+    opts.frame_opts.remove_dc_offset = true;
+    opts.frame_opts.window_type = "hamming".to_string();
+    opts.frame_opts.round_to_power_of_two = true;
+    opts.frame_opts.snip_edges = false;
+    opts.mel_opts.num_bins = ECAPA_MEL_BINS;
+    opts.mel_opts.low_freq = ECAPA_LOW_FREQ;
+    opts.mel_opts.high_freq = 0.0;
+    opts.mel_opts.is_librosa = false;
+    opts.mel_opts.use_slaney_mel_scale = false;
+    opts.mel_opts.norm.clear();
+    opts.use_energy = false;
+    opts.raw_energy = false;
+    opts.use_log_fbank = true;
+    opts.use_power = true;
 
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(fft_size);
-    let mut buffer = vec![Complex32::new(0.0, 0.0); fft_size];
-    let mut features = vec![0.0; frames * mel_bins];
+    let fbank = FbankComputer::new(opts)
+        .map_err(|error| anyhow!("failed to create ECAPA fbank extractor: {error}"))?;
+    let mut online = OnlineFeature::new(FeatureComputer::Fbank(fbank));
+    online.accept_waveform(16_000.0, wav);
+    online.input_finished();
 
+    let frames = online.num_frames_ready();
+    let mut features = Vec::with_capacity(frames * ECAPA_MEL_BINS);
     for frame in 0..frames {
-        buffer.fill(Complex32::new(0.0, 0.0));
-        let start = frame * frame_shift;
-        let mut raw = vec![0.0; frame_length];
-
-        for (index, sample) in raw.iter_mut().enumerate() {
-            let source = (start + index).min(wav.len() - 1);
-            *sample = wav[source] * 32768.0;
+        let values = online
+            .get_frame(frame)
+            .ok_or_else(|| anyhow!("missing ECAPA fbank frame {frame}"))?;
+        if values.len() != ECAPA_MEL_BINS {
+            bail!(
+                "ECAPA fbank dimension mismatch: got {}, expected {}",
+                values.len(),
+                ECAPA_MEL_BINS
+            );
         }
-
-        let mean = raw.iter().sum::<f32>() / raw.len() as f32;
-        for sample in &mut raw {
-            *sample -= mean;
-        }
-
-        let first = raw[0];
-        for index in (1..raw.len()).rev() {
-            raw[index] -= 0.97 * raw[index - 1];
-        }
-        raw[0] -= 0.97 * first;
-
-        for index in 0..frame_length {
-            buffer[index].re = raw[index] * hamming[index];
-        }
-        fft.process(&mut buffer);
-
-        let power_bins = fft_size / 2 + 1;
-        let mut power = vec![0.0; power_bins];
-        for bin in 0..power_bins {
-            let value = buffer[bin];
-            power[bin] = value.re.mul_add(value.re, value.im * value.im);
-        }
-
-        for mel in 0..mel_bins {
-            let energy = mel_filters[mel]
-                .iter()
-                .map(|(bin, weight)| power[*bin] * *weight)
-                .sum::<f32>()
-                .max(f32::EPSILON);
-            features[frame * mel_bins + mel] = energy.ln();
-        }
+        features.extend_from_slice(values);
     }
 
-    mean_normalize_features(&mut features, frames, mel_bins);
+    mean_normalize_features(&mut features, frames, ECAPA_MEL_BINS);
 
-    let mut fixed = vec![0.0; target_frames * mel_bins];
-    let copy_frames = frames.min(target_frames);
+    let mut fixed = vec![0.0; ECAPA_FRAMES * ECAPA_MEL_BINS];
+    let copy_frames = frames.min(ECAPA_FRAMES);
     for frame in 0..copy_frames {
-        let source = frame * mel_bins;
-        let destination = frame * mel_bins;
-        fixed[destination..destination + mel_bins]
-            .copy_from_slice(&features[source..source + mel_bins]);
+        let source = frame * ECAPA_MEL_BINS;
+        let destination = frame * ECAPA_MEL_BINS;
+        fixed[destination..destination + ECAPA_MEL_BINS]
+            .copy_from_slice(&features[source..source + ECAPA_MEL_BINS]);
     }
 
     Ok(fixed)
@@ -597,59 +583,6 @@ fn mean_normalize_features(features: &mut [f32], frames: usize, mel_bins: usize)
             features[frame * mel_bins + mel] -= mean;
         }
     }
-}
-
-fn mel_filterbank(mel_bins: usize, fft_size: usize, sample_rate: u32) -> Vec<Vec<(usize, f32)>> {
-    let num_fft_bins = fft_size / 2 + 1;
-    let high_freq = sample_rate as f32 / 2.0;
-    let low_mel = hz_to_mel(ECAPA_LOW_FREQ);
-    let high_mel = hz_to_mel(high_freq);
-    let mel_step = (high_mel - low_mel) / (mel_bins + 1) as f32;
-    let mel_points: Vec<f32> = (0..mel_bins + 2)
-        .map(|index| mel_to_hz(low_mel + index as f32 * mel_step))
-        .collect();
-
-    let mut filters = Vec::with_capacity(mel_bins);
-    for mel in 0..mel_bins {
-        let left = mel_points[mel];
-        let center = mel_points[mel + 1];
-        let right = mel_points[mel + 2];
-        let mut filter = Vec::new();
-
-        for bin in 0..num_fft_bins {
-            let freq = bin as f32 * sample_rate as f32 / fft_size as f32;
-            let weight = if freq > left && freq <= center {
-                (freq - left) / (center - left)
-            } else if freq > center && freq < right {
-                (right - freq) / (right - center)
-            } else {
-                0.0
-            };
-            if weight > 0.0 {
-                filter.push((bin, weight));
-            }
-        }
-        filters.push(filter);
-    }
-
-    filters
-}
-
-fn hz_to_mel(freq: f32) -> f32 {
-    1127.0 * (1.0 + freq / 700.0).ln()
-}
-
-fn mel_to_hz(mel: f32) -> f32 {
-    700.0 * ((mel / 1127.0).exp() - 1.0)
-}
-
-fn hamming_window(size: usize) -> Vec<f32> {
-    if size == 1 {
-        return vec![1.0];
-    }
-    (0..size)
-        .map(|index| 0.54 - 0.46 * (2.0 * PI * index as f32 / (size - 1) as f32).cos())
-        .collect()
 }
 
 struct DspContext {
