@@ -1832,7 +1832,7 @@ extern crate std;
 impl<B: Backend> Default for Model<B> {
     fn default() -> Self {
         Self::from_file(
-            "/tmp/burn_onnx_htcl_mzp/target/debug/build/burn-onnx-converter-g-map-se-e2203681cc35ab3b/out/model/g_map_se.bpk",
+            "/tmp/burn_onnx_tm6m60pu/target/debug/build/burn-onnx-converter-g-map-se-e2203681cc35ab3b/out/model/g_map_se.bpk",
             &Default::default(),
         )
     }
