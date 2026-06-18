@@ -3,6 +3,8 @@ use std::{
     f32::consts::PI,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -13,7 +15,7 @@ use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::{prelude::*, tensor::TensorData};
 use clap::Parser;
 use num_complex::Complex32;
-use rustfft::FftPlanner;
+use rustfft::{Fft, FftPlanner};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -77,6 +79,9 @@ struct Args {
 
     #[arg(long, default_value = "default")]
     device: String,
+
+    #[arg(long)]
+    profile: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +138,7 @@ fn run(args: Args) -> Result<()> {
     println!("Device: {:?}", device);
     println!("Files: {}", input_files.len());
 
+    let mut dsp = DspContext::new(&metadata);
     for (index, input_file) in input_files.iter().enumerate() {
         println!(
             "[{}/{}] {}",
@@ -140,7 +146,12 @@ fn run(args: Args) -> Result<()> {
             input_files.len(),
             input_file.display()
         );
+        let file_start = Instant::now();
+        let read_start = Instant::now();
         let wav = read_wav_mono(input_file, metadata.sampling_rate)?;
+        let read_elapsed = read_start.elapsed();
+
+        let embedding_start = Instant::now();
         let embedding = embedding_for_file(
             input_file,
             embeddings.as_ref(),
@@ -151,9 +162,24 @@ fn run(args: Args) -> Result<()> {
             metadata.embed_dim,
             args.allow_zero_embedding_fallback,
         )?;
+        let embedding_elapsed = embedding_start.elapsed();
+
+        let enhance_start = Instant::now();
         let norm_factor = rms_norm_factor(&wav);
         let normalized: Vec<f32> = wav.iter().map(|sample| sample * norm_factor).collect();
-        let enhanced = enhance_audio(&model, &device, &normalized, &embedding, &metadata)?;
+        let mut enhance_stats = EnhanceStats::default();
+        let enhanced = enhance_audio(
+            &model,
+            &device,
+            &mut dsp,
+            &normalized,
+            &embedding,
+            &metadata,
+            args.profile.then_some(&mut enhance_stats),
+        )?;
+        let enhance_elapsed = enhance_start.elapsed();
+
+        let write_start = Instant::now();
         let denormalized: Vec<f32> = enhanced
             .into_iter()
             .map(|sample| sample / norm_factor)
@@ -165,9 +191,36 @@ fn run(args: Args) -> Result<()> {
                 .ok_or_else(|| anyhow!("invalid input filename {}", input_file.display()))?,
         );
         write_wav_mono(&output_file, &denormalized, metadata.sampling_rate)?;
+        let write_elapsed = write_start.elapsed();
+
+        if args.profile {
+            eprintln!(
+                "profile {}: total={:.3}s read={:.3}s embedding={:.3}s enhance={:.3}s write={:.3}s",
+                input_file.display(),
+                seconds(file_start.elapsed()),
+                seconds(read_elapsed),
+                seconds(embedding_elapsed),
+                seconds(enhance_elapsed),
+                seconds(write_elapsed),
+            );
+            eprintln!(
+                "profile enhance: chunks={} stft={:.3}s tensor_upload={:.3}s forward={:.3}s download={:.3}s istft={:.3}s blend={:.3}s",
+                enhance_stats.chunks,
+                seconds(enhance_stats.stft),
+                seconds(enhance_stats.tensor_upload),
+                seconds(enhance_stats.forward),
+                seconds(enhance_stats.download),
+                seconds(enhance_stats.istft),
+                seconds(enhance_stats.blend),
+            );
+        }
     }
 
     Ok(())
+}
+
+fn seconds(duration: Duration) -> f64 {
+    duration.as_secs_f64()
 }
 
 fn validate_metadata(metadata: &Metadata) -> Result<()> {
@@ -567,22 +620,78 @@ fn hamming_window(size: usize) -> Vec<f32> {
         .collect()
 }
 
+struct DspContext {
+    stft_fft: Arc<dyn Fft<f32>>,
+    istft_fft: Arc<dyn Fft<f32>>,
+    stft_window: Vec<f32>,
+    istft_window: Vec<f32>,
+    stft_buffer: Vec<Complex32>,
+    istft_buffer: Vec<Complex32>,
+    padded: Vec<f32>,
+}
+
+impl DspContext {
+    fn new(metadata: &Metadata) -> Self {
+        let mut planner = FftPlanner::<f32>::new();
+        let stft_fft = planner.plan_fft_forward(metadata.n_fft);
+        let istft_fft = planner.plan_fft_inverse(metadata.n_fft);
+        let stft_window = hann_window(metadata.win_size);
+        let istft_window = stft_window.clone();
+        let stft_buffer = vec![Complex32::new(0.0, 0.0); metadata.n_fft];
+        let istft_buffer = vec![Complex32::new(0.0, 0.0); metadata.n_fft];
+
+        Self {
+            stft_fft,
+            istft_fft,
+            stft_window,
+            istft_window,
+            stft_buffer,
+            istft_buffer,
+            padded: Vec::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct EnhanceStats {
+    chunks: usize,
+    stft: Duration,
+    tensor_upload: Duration,
+    forward: Duration,
+    download: Duration,
+    istft: Duration,
+    blend: Duration,
+}
+
 fn enhance_audio(
     model: &EnhancementModel<B>,
     device: &BackendDevice,
+    dsp: &mut DspContext,
     noisy_wav: &[f32],
     embedding: &[f32],
     metadata: &Metadata,
+    mut stats: Option<&mut EnhanceStats>,
 ) -> Result<Vec<f32>> {
+    let upload_start = Instant::now();
+    let prior = Tensor::<B, 2>::from_data(
+        TensorData::new(embedding.to_vec(), [1, metadata.embed_dim]),
+        device,
+    );
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.tensor_upload += upload_start.elapsed();
+    }
+
     if noisy_wav.len() <= metadata.chunk_size {
         return enhance_chunk_to_length(
             model,
             device,
+            dsp,
             noisy_wav,
             metadata.chunk_size,
             noisy_wav.len(),
-            embedding,
+            &prior,
             metadata,
+            stats.as_deref_mut(),
         );
     }
 
@@ -597,12 +706,15 @@ fn enhance_audio(
         let enhanced = enhance_chunk_to_length(
             model,
             device,
+            dsp,
             &noisy_wav[start..end],
             metadata.chunk_size,
             chunk_len,
-            embedding,
+            &prior,
             metadata,
+            stats.as_deref_mut(),
         )?;
+        let blend_start = Instant::now();
         let window = overlap_window(
             chunk_len,
             metadata.overlap_size,
@@ -613,6 +725,9 @@ fn enhance_audio(
         for index in 0..chunk_len {
             output[start + index] += enhanced[index] * window[index];
             weight[start + index] += window[index];
+        }
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.blend += blend_start.elapsed();
         }
 
         if end == noisy_wav.len() {
@@ -630,15 +745,17 @@ fn enhance_audio(
 fn enhance_chunk_to_length(
     model: &EnhancementModel<B>,
     device: &BackendDevice,
+    dsp: &mut DspContext,
     noisy_wav: &[f32],
     model_chunk_size: usize,
     output_length: usize,
-    embedding: &[f32],
+    prior: &Tensor<B, 2>,
     metadata: &Metadata,
+    stats: Option<&mut EnhanceStats>,
 ) -> Result<Vec<f32>> {
     let mut chunk = noisy_wav.to_vec();
     chunk.resize(model_chunk_size, 0.0);
-    let enhanced = enhance_chunk(model, device, &chunk, embedding, metadata)?;
+    let enhanced = enhance_chunk(model, device, dsp, &chunk, prior, metadata, stats)?;
     let mut fixed = enhanced;
     fixed.resize(output_length, 0.0);
     fixed.truncate(output_length);
@@ -648,31 +765,50 @@ fn enhance_chunk_to_length(
 fn enhance_chunk(
     model: &EnhancementModel<B>,
     device: &BackendDevice,
+    dsp: &mut DspContext,
     noisy_wav: &[f32],
-    embedding: &[f32],
+    prior: &Tensor<B, 2>,
     metadata: &Metadata,
+    mut stats: Option<&mut EnhanceStats>,
 ) -> Result<Vec<f32>> {
-    let stft = mag_pha_stft(noisy_wav, metadata);
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.chunks += 1;
+    }
+
+    let stft_start = Instant::now();
+    let stft = mag_pha_stft(noisy_wav, metadata, dsp);
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.stft += stft_start.elapsed();
+    }
     let freq_bins = metadata.n_fft / 2 + 1;
     let frames = stft.frames;
 
+    let upload_start = Instant::now();
     let amp = Tensor::<B, 3>::from_data(TensorData::new(stft.mag, [1, freq_bins, frames]), device);
     let pha = Tensor::<B, 3>::from_data(TensorData::new(stft.pha, [1, freq_bins, frames]), device);
-    let prior = Tensor::<B, 2>::from_data(
-        TensorData::new(embedding.to_vec(), [1, metadata.embed_dim]),
-        device,
-    );
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.tensor_upload += upload_start.elapsed();
+    }
 
-    let (amp_g, pha_g) = model.forward(amp, pha, prior);
+    let forward_start = Instant::now();
+    let (amp_g, pha_g) = model.forward(amp, pha, prior.clone());
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.forward += forward_start.elapsed();
+    }
+
+    let download_start = Instant::now();
     let amp_vec = amp_g.into_data().into_vec::<f32>()?;
     let pha_vec = pha_g.into_data().into_vec::<f32>()?;
-    Ok(mag_pha_istft(
-        &amp_vec,
-        &pha_vec,
-        frames,
-        noisy_wav.len(),
-        metadata,
-    ))
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.download += download_start.elapsed();
+    }
+
+    let istft_start = Instant::now();
+    let enhanced = mag_pha_istft(&amp_vec, &pha_vec, frames, noisy_wav.len(), metadata, dsp);
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.istft += istft_start.elapsed();
+    }
+    Ok(enhanced)
 }
 
 fn overlap_window(
@@ -706,30 +842,25 @@ struct Stft {
     frames: usize,
 }
 
-fn mag_pha_stft(samples: &[f32], metadata: &Metadata) -> Stft {
-    let padded = reflect_pad(samples, metadata.n_fft / 2);
-    let frames = (padded.len() - metadata.n_fft) / metadata.hop_size + 1;
+fn mag_pha_stft(samples: &[f32], metadata: &Metadata, dsp: &mut DspContext) -> Stft {
+    reflect_pad_into(samples, metadata.n_fft / 2, &mut dsp.padded);
+    let frames = (dsp.padded.len() - metadata.n_fft) / metadata.hop_size + 1;
     let freq_bins = metadata.n_fft / 2 + 1;
-    let window = hann_window(metadata.win_size);
-
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(metadata.n_fft);
-    let mut buffer = vec![Complex32::new(0.0, 0.0); metadata.n_fft];
     let mut mag = vec![0.0; freq_bins * frames];
     let mut pha = vec![0.0; freq_bins * frames];
 
     for frame in 0..frames {
-        buffer.fill(Complex32::new(0.0, 0.0));
+        dsp.stft_buffer.fill(Complex32::new(0.0, 0.0));
         let frame_start = frame * metadata.hop_size;
         let win_offset = (metadata.n_fft - metadata.win_size) / 2;
         for index in 0..metadata.win_size {
-            buffer[win_offset + index].re =
-                padded[frame_start + win_offset + index] * window[index];
+            dsp.stft_buffer[win_offset + index].re =
+                dsp.padded[frame_start + win_offset + index] * dsp.stft_window[index];
         }
-        fft.process(&mut buffer);
+        dsp.stft_fft.process(&mut dsp.stft_buffer);
 
         for freq in 0..freq_bins {
-            let value = buffer[freq];
+            let value = dsp.stft_buffer[freq];
             let out_index = freq * frames + frame;
             mag[out_index] = (value.re.mul_add(value.re, value.im * value.im) + 1e-9)
                 .sqrt()
@@ -747,38 +878,35 @@ fn mag_pha_istft(
     frames: usize,
     output_len: usize,
     metadata: &Metadata,
+    dsp: &mut DspContext,
 ) -> Vec<f32> {
     let freq_bins = metadata.n_fft / 2 + 1;
     let padded_len = metadata.n_fft + metadata.hop_size * (frames - 1);
     let mut output = vec![0.0; padded_len];
     let mut window_sum = vec![0.0; padded_len];
-    let window = hann_window(metadata.win_size);
-
-    let mut planner = FftPlanner::<f32>::new();
-    let ifft = planner.plan_fft_inverse(metadata.n_fft);
-    let mut buffer = vec![Complex32::new(0.0, 0.0); metadata.n_fft];
 
     for frame in 0..frames {
-        buffer.fill(Complex32::new(0.0, 0.0));
+        dsp.istft_buffer.fill(Complex32::new(0.0, 0.0));
         for freq in 0..freq_bins {
             let index = freq * frames + frame;
             let magnitude = mag[index].max(0.0).powf(1.0 / metadata.compress_factor);
             let phase = pha[index];
-            buffer[freq] = Complex32::new(magnitude * phase.cos(), magnitude * phase.sin());
+            dsp.istft_buffer[freq] =
+                Complex32::new(magnitude * phase.cos(), magnitude * phase.sin());
         }
         for freq in 1..(freq_bins - 1) {
-            buffer[metadata.n_fft - freq] = buffer[freq].conj();
+            dsp.istft_buffer[metadata.n_fft - freq] = dsp.istft_buffer[freq].conj();
         }
 
-        ifft.process(&mut buffer);
+        dsp.istft_fft.process(&mut dsp.istft_buffer);
 
         let frame_start = frame * metadata.hop_size;
         let win_offset = (metadata.n_fft - metadata.win_size) / 2;
         for index in 0..metadata.win_size {
-            let sample = buffer[win_offset + index].re / metadata.n_fft as f32;
+            let sample = dsp.istft_buffer[win_offset + index].re / metadata.n_fft as f32;
             let position = frame_start + win_offset + index;
-            output[position] += sample * window[index];
-            window_sum[position] += window[index] * window[index];
+            output[position] += sample * dsp.istft_window[index];
+            window_sum[position] += dsp.istft_window[index] * dsp.istft_window[index];
         }
     }
 
@@ -792,19 +920,24 @@ fn mag_pha_istft(
     output[trim..(trim + output_len).min(output.len())].to_vec()
 }
 
-fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
+fn reflect_pad_into(samples: &[f32], pad: usize, padded: &mut Vec<f32>) {
+    padded.clear();
     if pad == 0 {
-        return samples.to_vec();
+        padded.extend_from_slice(samples);
+        return;
     }
     if samples.len() <= 1 {
-        let mut padded = vec![samples.first().copied().unwrap_or(0.0); samples.len() + 2 * pad];
+        padded.resize(
+            samples.len() + 2 * pad,
+            samples.first().copied().unwrap_or(0.0),
+        );
         if !samples.is_empty() {
             padded[pad] = samples[0];
         }
-        return padded;
+        return;
     }
 
-    let mut padded = Vec::with_capacity(samples.len() + 2 * pad);
+    padded.reserve(samples.len() + 2 * pad);
     for index in (1..=pad).rev() {
         padded.push(samples[index.min(samples.len() - 1)]);
     }
@@ -813,7 +946,6 @@ fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
         let source = samples.len().saturating_sub(2 + index);
         padded.push(samples[source]);
     }
-    padded
 }
 
 fn hann_window(size: usize) -> Vec<f32> {
