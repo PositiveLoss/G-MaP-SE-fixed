@@ -9,6 +9,8 @@ build = "build.rs"
 default = ["wgpu"]
 wgpu = ["burn/std", "burn/fusion", "burn/wgpu"]
 cuda = ["burn/std", "burn/fusion", "burn/cuda"]
+wgpu-autotune = ["wgpu", "burn/autotune"]
+cuda-autotune = ["cuda", "burn/autotune"]
 
 [dependencies]
 anyhow = "1.0"

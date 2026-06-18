@@ -46,7 +46,7 @@ type B = Wgpu;
 type BackendDevice = WgpuDevice;
 
 #[cfg(feature = "cuda")]
-const BACKEND_NAME: &str = "CUDA";
+const BACKEND_NAME: &str = "CUDA (CubeCL)";
 #[cfg(all(not(feature = "cuda"), feature = "wgpu"))]
 const BACKEND_NAME: &str = "WGPU";
 
