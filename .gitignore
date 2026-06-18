@@ -42,3 +42,5 @@ clean_wavs/
 onnx/
 clean_wavs_onnx/
 burn_models/
+
+rust/target/
