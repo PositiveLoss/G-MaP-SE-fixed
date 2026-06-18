@@ -43,4 +43,5 @@ onnx/
 clean_wavs_onnx/
 
 rust/target/
+rust-ort/target/
 cleaned_wavs/
