@@ -63,6 +63,15 @@ Run inference on noisy speech:
 python inference_g_map_se.py --input_noisy_wavs_dir <path> --output_dir <output_path> --checkpoint_file ckpt/g_best
 ```
 
+## Export to ONNX
+
+```
+uv run export_g_map_se_onnx.py \
+  --checkpoint_file ckpt/g_best \
+  --output onnx/g_map_se.onnx \
+  --slim_output onnx/g_map_se.slim.onnx
+```
+
 ## Acknowledgements
 
-We referred to [MP-SENet](https://github.com/jik876/hifi-gan) to implement this.
+We referred to [MP-SENet](https://github.com/yxlu-0102/MP-SENet) to implement this.
