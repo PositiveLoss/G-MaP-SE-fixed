@@ -525,7 +525,7 @@ fn kaldi_fbank_fixed(wav: &[f32], _dsp: &mut DspContext) -> Result<Vec<f32>> {
     opts.frame_opts.remove_dc_offset = true;
     opts.frame_opts.window_type = "hamming".to_string();
     opts.frame_opts.round_to_power_of_two = true;
-    opts.frame_opts.snip_edges = false;
+    opts.frame_opts.snip_edges = true;
     opts.mel_opts.num_bins = ECAPA_MEL_BINS;
     opts.mel_opts.low_freq = ECAPA_LOW_FREQ;
     opts.mel_opts.high_freq = 0.0;
@@ -544,6 +544,10 @@ fn kaldi_fbank_fixed(wav: &[f32], _dsp: &mut DspContext) -> Result<Vec<f32>> {
     online.input_finished();
 
     let frames = online.num_frames_ready();
+    if frames == 0 {
+        bail!("ECAPA fbank produced no frames");
+    }
+
     let mut features = Vec::with_capacity(frames * ECAPA_MEL_BINS);
     for frame in 0..frames {
         let values = online
