@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Logs and local runs
+*.log
+runs/
+logs/
+output/
+generated_files/
+
+# Training checkpoints and model artifacts
+*.ckpt
+*.pt
+*.pth
+*.onnx
+checkpoints/
+
+# Local editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+clean_wavs/
