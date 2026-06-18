@@ -14,6 +14,8 @@ use kaldi_native_fbank::{
     online::{FeatureComputer, OnlineFeature},
 };
 use num_complex::Complex32;
+#[cfg(feature = "cuda")]
+use ort::ep;
 use ort::{session::Session, value::Tensor};
 use rustfft::{Fft, FftPlanner};
 use serde::Deserialize;
@@ -46,6 +48,9 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Provider::Auto)]
     provider: Provider,
 
+    #[arg(long, default_value = "cuda:0")]
+    device: String,
+
     #[arg(long)]
     profile: bool,
 }
@@ -54,6 +59,7 @@ struct Args {
 enum Provider {
     Auto,
     Cpu,
+    Cuda,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,11 +121,12 @@ fn run(args: Args) -> Result<()> {
         .or(metadata.ecapa_model_path.as_deref())
         .map(resolve_path)
         .transpose()?;
-    let mut model = create_session(&onnx_file, args.provider)
+    let cuda_device_id = parse_device_id(&args.device)?;
+    let mut model = create_session(&onnx_file, args.provider, cuda_device_id)
         .with_context(|| format!("failed to load enhancement model {}", onnx_file.display()))?;
     let mut ecapa_model = match ecapa_onnx_file.as_deref() {
         Some(path) if path.is_file() => Some(
-            create_session(path, Provider::Cpu)
+            create_session(path, Provider::Cpu, cuda_device_id)
                 .with_context(|| format!("failed to load ECAPA model {}", path.display()))?,
         ),
         _ => None,
@@ -133,7 +140,10 @@ fn run(args: Args) -> Result<()> {
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("failed to create {}", args.output_dir.display()))?;
 
-    println!("ONNX Runtime provider: CPUExecutionProvider");
+    println!("ONNX Runtime provider: {}", provider_label(args.provider));
+    if matches!(args.provider, Provider::Cuda) {
+        println!("CUDA device: {cuda_device_id}");
+    }
     println!("Enhancement model: {}", onnx_file.display());
     if let Some(path) = &ecapa_onnx_file {
         println!("ECAPA model: {}", path.display());
@@ -227,12 +237,50 @@ fn seconds(duration: Duration) -> f64 {
     duration.as_secs_f64()
 }
 
-fn create_session(path: &Path, provider: Provider) -> Result<Session> {
-    match provider {
-        Provider::Auto | Provider::Cpu => {}
-    }
+fn create_session(path: &Path, provider: Provider, cuda_device_id: i32) -> Result<Session> {
     let mut builder = Session::builder()?;
+    if matches!(provider, Provider::Cuda) {
+        builder = with_cuda_provider(builder, cuda_device_id)?;
+    }
     Ok(builder.commit_from_file(path)?)
+}
+
+#[cfg(feature = "cuda")]
+fn with_cuda_provider(
+    builder: ort::session::builder::SessionBuilder,
+    cuda_device_id: i32,
+) -> Result<ort::session::builder::SessionBuilder> {
+    builder
+        .with_execution_providers([ep::CUDA::default().with_device_id(cuda_device_id).build()])
+        .map_err(|error| anyhow!("failed to register CUDAExecutionProvider: {error}"))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn with_cuda_provider(
+    _builder: ort::session::builder::SessionBuilder,
+    _cuda_device_id: i32,
+) -> Result<ort::session::builder::SessionBuilder> {
+    bail!("--provider cuda requires building rust-ort with: cargo build --release --features cuda")
+}
+
+fn provider_label(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Auto | Provider::Cpu => "CPUExecutionProvider",
+        Provider::Cuda => "CUDAExecutionProvider",
+    }
+}
+
+fn parse_device_id(value: &str) -> Result<i32> {
+    if value == "default" {
+        return Ok(0);
+    }
+    if let Some(index) = value.strip_prefix("cuda:") {
+        return Ok(index.parse()?);
+    }
+    if let Ok(index) = value.parse() {
+        return Ok(index);
+    }
+    bail!("unsupported --device '{value}', expected default, cuda:N, or N")
 }
 
 fn validate_metadata(metadata: &Metadata) -> Result<()> {
