@@ -16,6 +16,190 @@ use burn::tensor::Bytes;
 use burn_store::BurnpackStore;
 use burn_store::ModuleSnapshot;
 
+fn fast_bigru_forward<B: Backend>(
+    gru: &burn::nn::gru::BiGru<B>,
+    input: Tensor<B, 3>,
+    state: Tensor<B, 3>,
+) -> (Tensor<B, 3>, Tensor<B, 3>) {
+    let input = if gru.batch_first {
+        input
+    } else {
+        input.swap_dims(0, 1)
+    };
+
+    let [batch_size, _, _] = input.dims();
+    let hidden = gru.d_hidden;
+    let init_forward = state
+        .clone()
+        .slice([0..1, 0..batch_size, 0..hidden])
+        .squeeze_dim(0);
+    let init_reverse = state
+        .slice([1..2, 0..batch_size, 0..hidden])
+        .squeeze_dim(0);
+
+    let (forward, forward_state) =
+        fast_gru_direction(&gru.forward, input.clone(), init_forward, false);
+    let (reverse, reverse_state) = fast_gru_direction(&gru.reverse, input, init_reverse, true);
+    let output = Tensor::cat([forward, reverse].into(), 2);
+    let output = if gru.batch_first {
+        output
+    } else {
+        output.swap_dims(0, 1)
+    };
+    let final_state = Tensor::cat(
+        [
+            forward_state.unsqueeze_dim(0),
+            reverse_state.unsqueeze_dim(0),
+        ]
+        .into(),
+        0,
+    );
+
+    (output, final_state)
+}
+
+fn fast_gru_direction<B: Backend>(
+    gru: &burn::nn::gru::Gru<B>,
+    input: Tensor<B, 3>,
+    initial_hidden: Tensor<B, 2>,
+    reverse: bool,
+) -> (Tensor<B, 3>, Tensor<B, 2>) {
+    debug_assert!(
+        !gru.reset_after,
+        "fast_gru_direction matches reset_after(false) GRUs"
+    );
+
+    let [batch_size, seq_len, input_size] = input.dims();
+    let hidden = gru.d_hidden;
+    let dtype = input.dtype();
+    let device = input.device();
+
+    let input_weight = Tensor::cat(
+        [
+            gru.update_gate.input_transform.weight.val(),
+            gru.reset_gate.input_transform.weight.val(),
+            gru.new_gate.input_transform.weight.val(),
+        ]
+        .into(),
+        1,
+    );
+    let input_bias = Tensor::cat(
+        [
+            gru.update_gate
+                .input_transform
+                .bias
+                .as_ref()
+                .expect("generated GRU has input update bias")
+                .val(),
+            gru.reset_gate
+                .input_transform
+                .bias
+                .as_ref()
+                .expect("generated GRU has input reset bias")
+                .val(),
+            gru.new_gate
+                .input_transform
+                .bias
+                .as_ref()
+                .expect("generated GRU has input new bias")
+                .val(),
+        ]
+        .into(),
+        0,
+    )
+    .unsqueeze();
+    let input_projected = input
+        .reshape([batch_size * seq_len, input_size])
+        .matmul(input_weight)
+        .reshape([batch_size, seq_len, hidden * 3])
+        + input_bias;
+
+    let hidden_zr_weight = Tensor::cat(
+        [
+            gru.update_gate.hidden_transform.weight.val(),
+            gru.reset_gate.hidden_transform.weight.val(),
+        ]
+        .into(),
+        1,
+    );
+    let hidden_zr_bias = Tensor::cat(
+        [
+            gru.update_gate
+                .hidden_transform
+                .bias
+                .as_ref()
+                .expect("generated GRU has hidden update bias")
+                .val(),
+            gru.reset_gate
+                .hidden_transform
+                .bias
+                .as_ref()
+                .expect("generated GRU has hidden reset bias")
+                .val(),
+        ]
+        .into(),
+        0,
+    )
+    .unsqueeze();
+    let hidden_new_weight = gru.new_gate.hidden_transform.weight.val();
+    let hidden_new_bias = gru
+        .new_gate
+        .hidden_transform
+        .bias
+        .as_ref()
+        .expect("generated GRU has hidden new bias")
+        .val()
+        .unsqueeze();
+
+    let mut hidden_t = initial_hidden;
+    let mut outputs = Vec::with_capacity(seq_len);
+
+    for step in 0..seq_len {
+        let t = if reverse { seq_len - 1 - step } else { step };
+        let input_t = input_projected
+            .clone()
+            .slice([0..batch_size, t..(t + 1), 0..(hidden * 3)])
+            .squeeze_dim(1);
+        let input_z = input_t.clone().slice([0..batch_size, 0..hidden]);
+        let input_r = input_t
+            .clone()
+            .slice([0..batch_size, hidden..(hidden * 2)]);
+        let input_n = input_t.slice([0..batch_size, (hidden * 2)..(hidden * 3)]);
+
+        let hidden_zr = hidden_t.clone().matmul(hidden_zr_weight.clone()) + hidden_zr_bias.clone();
+        let hidden_z = hidden_zr.clone().slice([0..batch_size, 0..hidden]);
+        let hidden_r = hidden_zr.slice([0..batch_size, hidden..(hidden * 2)]);
+
+        let update_values = gru.gate_activation.forward(input_z + hidden_z);
+        let reset_values = gru.gate_activation.forward(input_r + hidden_r);
+        let reset_hidden = hidden_t.clone().mul(reset_values);
+        let candidate_state = gru.hidden_activation.forward(
+            input_n + reset_hidden.matmul(hidden_new_weight.clone()) + hidden_new_bias.clone(),
+        );
+
+        let one_minus_z = update_values.clone().neg().add_scalar(1.0);
+        hidden_t = candidate_state.mul(one_minus_z) + update_values.mul(hidden_t);
+
+        if let Some(clip) = gru.clip {
+            hidden_t = hidden_t.clamp(-clip, clip);
+        }
+
+        outputs.push(hidden_t.clone().unsqueeze_dim(1));
+    }
+
+    if reverse {
+        outputs.reverse();
+    }
+
+    let output = if outputs.is_empty() {
+        Tensor::zeros([batch_size, 0, hidden], (&device, dtype))
+    } else {
+        Tensor::cat(outputs, 1)
+    };
+
+    (output, hidden_t)
+}
+
 
 #[derive(Module, Debug)]
 pub struct Submodule1<B: Backend> {
@@ -427,9 +611,8 @@ impl<B: Backend> Submodule1<B> {
         };
         let constant70_out1 = self.constant70.val();
         let gru1_out1 = {
-            let (output_seq, _final_state) = self
-                .gru1
-                .forward(layernormalization2_out1, Some(constant70_out1));
+            let (output_seq, _final_state) =
+                fast_bigru_forward(&self.gru1, layernormalization2_out1, constant70_out1);
             {
                 let [seq_len, batch_size, _] = output_seq.dims();
                 let reshaped = output_seq.reshape([seq_len, batch_size, 2, 128usize]);
@@ -631,9 +814,8 @@ impl<B: Backend> Submodule2<B> {
         };
         let constant93_out1 = self.constant93.val();
         let gru2_out1 = {
-            let (output_seq, _final_state) = self
-                .gru2
-                .forward(layernormalization5_out1, Some(constant93_out1));
+            let (output_seq, _final_state) =
+                fast_bigru_forward(&self.gru2, layernormalization5_out1, constant93_out1);
             {
                 let [seq_len, batch_size, _] = output_seq.dims();
                 let reshaped = output_seq.reshape([seq_len, batch_size, 2, 128usize]);
@@ -704,9 +886,8 @@ impl<B: Backend> Submodule2<B> {
         };
         let constant110_out1 = self.constant110.val();
         let gru3_out1 = {
-            let (output_seq, _final_state) = self
-                .gru3
-                .forward(layernormalization8_out1, Some(constant110_out1));
+            let (output_seq, _final_state) =
+                fast_bigru_forward(&self.gru3, layernormalization8_out1, constant110_out1);
             {
                 let [seq_len, batch_size, _] = output_seq.dims();
                 let reshaped = output_seq.reshape([seq_len, batch_size, 2, 128usize]);
@@ -1070,9 +1251,8 @@ impl<B: Backend> Submodule3<B> {
         };
         let constant126_out1 = self.constant126.val();
         let gru4_out1 = {
-            let (output_seq, _final_state) = self
-                .gru4
-                .forward(layernormalization11_out1, Some(constant126_out1));
+            let (output_seq, _final_state) =
+                fast_bigru_forward(&self.gru4, layernormalization11_out1, constant126_out1);
             {
                 let [seq_len, batch_size, _] = output_seq.dims();
                 let reshaped = output_seq.reshape([seq_len, batch_size, 2, 128usize]);
@@ -1143,9 +1323,8 @@ impl<B: Backend> Submodule3<B> {
         };
         let constant142_out1 = self.constant142.val();
         let gru5_out1 = {
-            let (output_seq, _final_state) = self
-                .gru5
-                .forward(layernormalization14_out1, Some(constant142_out1));
+            let (output_seq, _final_state) =
+                fast_bigru_forward(&self.gru5, layernormalization14_out1, constant142_out1);
             {
                 let [seq_len, batch_size, _] = output_seq.dims();
                 let reshaped = output_seq.reshape([seq_len, batch_size, 2, 128usize]);
@@ -1216,9 +1395,8 @@ impl<B: Backend> Submodule3<B> {
         };
         let constant158_out1 = self.constant158.val();
         let gru6_out1 = {
-            let (output_seq, _final_state) = self
-                .gru6
-                .forward(layernormalization17_out1, Some(constant158_out1));
+            let (output_seq, _final_state) =
+                fast_bigru_forward(&self.gru6, layernormalization17_out1, constant158_out1);
             {
                 let [seq_len, batch_size, _] = output_seq.dims();
                 let reshaped = output_seq.reshape([seq_len, batch_size, 2, 128usize]);
@@ -1289,9 +1467,8 @@ impl<B: Backend> Submodule3<B> {
         };
         let constant174_out1 = self.constant174.val();
         let gru7_out1 = {
-            let (output_seq, _final_state) = self
-                .gru7
-                .forward(layernormalization20_out1, Some(constant174_out1));
+            let (output_seq, _final_state) =
+                fast_bigru_forward(&self.gru7, layernormalization20_out1, constant174_out1);
             {
                 let [seq_len, batch_size, _] = output_seq.dims();
                 let reshaped = output_seq.reshape([seq_len, batch_size, 2, 128usize]);
@@ -1362,9 +1539,8 @@ impl<B: Backend> Submodule3<B> {
         };
         let constant190_out1 = self.constant190.val();
         let gru8_out1 = {
-            let (output_seq, _final_state) = self
-                .gru8
-                .forward(layernormalization23_out1, Some(constant190_out1));
+            let (output_seq, _final_state) =
+                fast_bigru_forward(&self.gru8, layernormalization23_out1, constant190_out1);
             {
                 let [seq_len, batch_size, _] = output_seq.dims();
                 let reshaped = output_seq.reshape([seq_len, batch_size, 2, 128usize]);

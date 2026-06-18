@@ -142,6 +142,9 @@ fn run(args: Args) -> Result<()> {
 
     println!("Burn backend: {BACKEND_NAME}");
     println!("Device: {:?}", device);
+    let warmup_start = Instant::now();
+    warmup_models(&model, &ecapa_model, &device, &metadata)?;
+    println!("Warmup: {:.3}s", warmup_start.elapsed().as_secs_f64());
     println!("Files: {}", input_files.len());
 
     let mut dsp = DspContext::new(&metadata);
@@ -404,6 +407,26 @@ fn extract_ecapa_embedding(
         );
     }
     Ok(embedding)
+}
+
+fn warmup_models(
+    _model: &EnhancementModel<B>,
+    ecapa_model: &EcapaModel<B>,
+    device: &BackendDevice,
+    _metadata: &Metadata,
+) -> Result<()> {
+    let backend_probe = Tensor::<B, 1>::zeros([1], (device, burn::tensor::DType::F32));
+    let _ = backend_probe.into_data().into_vec::<f32>()?;
+
+    let ecapa_input = Tensor::<B, 3>::zeros(
+        [1, ECAPA_FRAMES, ECAPA_MEL_BINS],
+        (device, burn::tensor::DType::F32),
+    );
+    let embedding = ecapa_model.forward(ecapa_input);
+    let _ = embedding.into_data().into_vec::<f32>()?;
+    B::sync(device).map_err(|err| anyhow!("backend warmup sync failed: {err:?}"))?;
+
+    Ok(())
 }
 
 fn read_wav_mono(path: &Path, target_rate: u32) -> Result<Vec<f32>> {
